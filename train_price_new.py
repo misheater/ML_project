@@ -1,4 +1,4 @@
-# train_price.py (с MLP_GELU_NoRes)
+# train_price.py (исправленная версия)
 import pandas as pd
 import numpy as np
 import re
@@ -47,7 +47,6 @@ def infer_device_type(row):
 df["device_type_label"] = df.apply(infer_device_type, axis=1)
 
 feature_cols = [c for c in df.columns if c not in drop_cols]
-print(f"Количество признаков: {len(feature_cols)}")
 
 df = df.dropna(subset=feature_cols + [target_col]).copy()
 print(f"После удаления NaN: {len(df)}")
@@ -149,8 +148,30 @@ df["cpu_tier_x_ram"] = df["cpu_tier"] * df["ram_gb"]
 df["gpu_tier_x_ram"] = df["gpu_tier"] * df["ram_gb"]
 df["cpu_tier_x_storage"] = df["cpu_tier"] * df["storage_gb"]
 
-feature_cols = [c for c in df.columns if c not in drop_cols]
-print(f"Количество признаков после фич-инжиниринга: {len(feature_cols)}")
+# Единые функции family (используются и при обучении, и на инференсе)
+def cpu_family(text):
+    if re.search(r"\bcore\s*i[3579]\b|\bintel\b", text, re.I):
+        return "intel"
+    if re.search(r"\bryzen\b|\bamd\b", text, re.I):
+        return "amd"
+    if re.search(r"\bsnapdragon\b", text, re.I):
+        return "snapdragon"
+    if re.search(r"\bmediatek\b|\bhelio\b|\bdimensity\b", text, re.I):
+        return "mediatek"
+    if re.search(r"\bbionic\b", text, re.I):
+        return "apple_bionic"
+    return "other"
+
+def gpu_family(text):
+    if re.search(r"\brtx\b", text, re.I):
+        return "rtx"
+    if re.search(r"\bgtx\b", text, re.I):
+        return "gtx"
+    if re.search(r"\bradeon\b", text, re.I):
+        return "radeon"
+    if re.search(r"\bintel iris\b|\bintel hd\b|\buhd\b", text, re.I):
+        return "intel_igpu"
+    return "other"
 
 # -----------------------------
 # 3) X, y и лог-цель
@@ -197,21 +218,6 @@ def add_target_encoding(train_df, val_df, col, target, min_count=10, alpha=20.0)
     return train_enc.astype(np.float32), val_enc.astype(np.float32), \
            {str(k): float(v) for k, v in smooth.to_dict().items()}, float(global_mean)
 
-def cpu_family(text):
-    if re.search(r"\bcore\s*i[3579]\b|\bintel\b", text): return "intel"
-    if re.search(r"\bryzen\b|\bamd\b", text): return "amd"
-    if re.search(r"\bsnapdragon\b", text): return "snapdragon"
-    if re.search(r"\bmediatek\b|\bhelio\b|\bdimensity\b", text): return "mediatek"
-    if re.search(r"\bbionic\b", text): return "apple_bionic"
-    return "other"
-
-def gpu_family(text):
-    if re.search(r"\brtx\b", text): return "rtx"
-    if re.search(r"\bgtx\b", text): return "gtx"
-    if re.search(r"\bradeon\b", text): return "radeon"
-    if re.search(r"\bintel iris\b|\bintel hd\b|\buhd\b", text): return "intel_igpu"
-    return "other"
-
 df_train["cpu_family"] = df_train["text_l"].apply(cpu_family)
 df_val["cpu_family"] = df_val["text_l"].apply(cpu_family)
 df_train["gpu_family"] = df_train["text_l"].apply(gpu_family)
@@ -230,10 +236,10 @@ exclude_cols = {
     "brand_token", "cpu_family", "gpu_family"
 }
 feature_cols = [c for c in df_train.columns if c not in exclude_cols and pd.api.types.is_numeric_dtype(df_train[c])]
+print(f"Финальное количество признаков: {len(feature_cols)}")   # теперь корректное количество
 
 X_train = df_train[feature_cols].values.astype(np.float32)
 X_val = df_val[feature_cols].values.astype(np.float32)
-print(f"Финальное количество признаков: {len(feature_cols)}")
 
 # -----------------------------
 # 4) Масштабирование
@@ -241,6 +247,8 @@ print(f"Финальное количество признаков: {len(feature
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train)
 X_val_scaled = scaler.transform(X_val)
+
+#превращаем в тензоры PyTorch
 
 X_train_t = torch.tensor(X_train_scaled, dtype=torch.float32)
 y_train_t = torch.tensor(y_train, dtype=torch.float32)
@@ -251,19 +259,18 @@ batch_size = 96
 train_dataset = TensorDataset(X_train_t, y_train_t)
 val_dataset = TensorDataset(X_val_t, y_val_t)
 
+#подсчитываем частоту для каждой группы и создаем сэмплер(чтобы редкие группыы тоже учитывались) (для каждого батча будем выбирать примеры с учетом частоты)
+
 group_counts = pd.Series(strat_train).value_counts()
 sample_weights = np.array([1.0 / group_counts[g] for g in strat_train], dtype=np.float32)
-sampler = WeightedRandomSampler(
-    weights=torch.tensor(sample_weights, dtype=torch.float32),
-    num_samples=len(sample_weights),
-    replacement=True
-)
-train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
-val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)
+
+# Важно: сэмплер будет создаваться внутри train_one_model с уникальным seed
+train_loader_base = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)  # только для справки, не используется
 
 # -----------------------------
 # 5) Модель (MLP GELU NoRes)
 # -----------------------------
+
 class MLP_GELU_NoRes(nn.Module):
     def __init__(self, input_dim):
         super().__init__()
@@ -302,7 +309,7 @@ def smape(y_true, y_pred):
 # -----------------------------
 # 7) Обучение + early stopping + ансамбль
 # -----------------------------
-num_epochs = 240
+num_epochs = 300
 patience = 28
 ensemble_seeds = [42, 52, 62]
 
@@ -320,6 +327,17 @@ def train_one_model(seed):
     optimizer = optim.AdamW(model.parameters(), lr=2e-3, weight_decay=7e-5)
     scheduler = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", factor=0.5, patience=6)
 
+    # Создаём сэмплер с собственным генератором для данного сида
+    generator = torch.Generator()
+    generator.manual_seed(seed)
+    sampler = WeightedRandomSampler(
+        weights=torch.tensor(sample_weights, dtype=torch.float32),
+        num_samples=len(sample_weights),
+        replacement=True,
+        generator=generator
+    )
+    train_loader = DataLoader(train_dataset, batch_size=batch_size, sampler=sampler)
+
     best_val_loss = float("inf")
     patience_counter = 0
     best_state = None
@@ -327,7 +345,7 @@ def train_one_model(seed):
     best_metrics = {}
     best_preds_rub = None
 
-    train_losses, val_losses, val_maes, val_mapes = [], [], [], []
+    train_losses, val_losses, val_maes, val_mapes,val_smapes = [], [], [], [], []
 
     print(f"\n=== Обучение модели seed={seed} ===")
     for epoch in range(num_epochs):
@@ -373,6 +391,7 @@ def train_one_model(seed):
 
         val_maes.append(epoch_mae)
         val_mapes.append(epoch_mape)
+        val_smapes.append(epoch_smape)
 
         print(
             f"[seed={seed}] Epoch {epoch+1:3d}/{num_epochs} | "
@@ -405,10 +424,12 @@ def train_one_model(seed):
         "history": {
             "train_losses": train_losses, "val_losses": val_losses,
             "val_maes": val_maes, "val_mapes": val_mapes,
+            "val_smapes": val_smapes,
         }
     }
 
 results = []
+val_loader = DataLoader(val_dataset, batch_size=batch_size, shuffle=False)  # заново для ясности
 for seed in ensemble_seeds:
     results.append(train_one_model(seed))
 
@@ -454,13 +475,12 @@ print("Препроцессинг сохранен: artifacts/scaler.pkl, artifa
 # 8) Графики
 # -----------------------------
 plt.style.use("dark_background")
-fig = plt.figure(figsize=(13, 4.8), facecolor="#000000")
+fig = plt.figure(figsize=(18, 5), facecolor="#000000")
 palette = {"train": "#7dd3fc", "val": "#f9a8d4", "mae": "#86efac", "mape": "#fcd34d"}
 
 hist = best_single["history"]
 
-# --- График 1: Loss ---
-ax1 = plt.subplot(1, 3, 1)
+ax1 = plt.subplot(1, 4, 1)
 ax1.set_facecolor("#0b0b0b")
 plt.plot(hist["train_losses"], label="Train Loss", color=palette["train"], linewidth=2.0)
 plt.plot(hist["val_losses"], label="Val Loss", color=palette["val"], linewidth=2.0)
@@ -469,11 +489,8 @@ plt.ylabel("Huber Loss")
 plt.title("Loss")
 plt.legend()
 ax1.grid(alpha=0.15, color="#ffffff")
-# Опционально: если loss тоже улетает в начале, можно ограничить
-# ax1.set_ylim(0, max(max(hist["train_losses"][5:]), max(hist["val_losses"][5:])) * 1.2)
 
-# --- График 2: MAE ---
-ax2 = plt.subplot(1, 3, 2)
+ax2 = plt.subplot(1, 4, 2)
 ax2.set_facecolor("#0b0b0b")
 plt.plot(hist["val_maes"], label="Single Val MAE", color=palette["mae"], linewidth=2.0)
 plt.axhline(ensemble_metrics["mae"], color="#22d3ee", linestyle="--", label="Ensemble MAE")
@@ -482,10 +499,9 @@ plt.ylabel("MAE (руб)")
 plt.title("Средняя абсолютная ошибка")
 plt.legend()
 ax2.grid(alpha=0.15, color="#ffffff")
-ax2.set_ylim(0, 400000)   # <-- ограничение, чтобы не было гигантских начальных значений
+ax2.set_ylim(0, 400000)
 
-# --- График 3: MAPE ---
-ax3 = plt.subplot(1, 3, 3)
+ax3 = plt.subplot(1, 4, 3)
 ax3.set_facecolor("#0b0b0b")
 plt.plot(hist["val_mapes"], label="Single Val MAPE", color=palette["mape"], linewidth=2.0)
 plt.axhline(ensemble_metrics["mape"], color="#a78bfa", linestyle="--", label="Ensemble MAPE")
@@ -494,20 +510,30 @@ plt.ylabel("MAPE (%)")
 plt.title("Средняя процентная ошибка")
 plt.legend()
 ax3.grid(alpha=0.15, color="#ffffff")
-ax3.set_ylim(0, 100)      # <-- MAPE в процентах, ограничиваем 100%
+ax3.set_ylim(0, 100)
+
+ax4 = plt.subplot(1, 4, 4)
+ax4.set_facecolor("#0b0b0b")
+plt.plot(hist["val_smapes"], label="Single Val SMAPE", color="#d8b4fe", linewidth=2.0)
+plt.axhline(ensemble_metrics["smape"], color="#c084fc", linestyle="--", label="Ensemble SMAPE")
+plt.xlabel("Epoch")
+plt.ylabel("SMAPE (%)")
+plt.title("Симметричная средняя процентная ошибка")
+plt.legend()
+ax4.grid(alpha=0.15, color="#ffffff")
+ax4.set_ylim(0, 100)
 
 plt.tight_layout()
 plt.show()
 
 # -----------------------------
-# 9) Примеры прогнозов (каждый раз разные)
+# 9) Примеры прогнозов
 # -----------------------------
 print("\n" + "=" * 90)
 print("Примеры прогнозов ансамбля (реальная цена vs предсказание)")
 print("=" * 90)
 
-# Вместо фиксированного сида используем текущее время или просто np.random
-rng = np.random.default_rng()   # каждый раз новые индексы
+rng = np.random.default_rng()
 n_samples = min(10, len(y_raw_val))
 sample_idx = rng.choice(len(y_raw_val), size=n_samples, replace=False)
 
@@ -523,10 +549,70 @@ for i in sample_idx:
           f"Прогноз: {pred_price:>10.0f} ₽ | "
           f"Ошибка: {abs(real_price - pred_price):>10.0f} ₽")
 
-          
-          
-          
-print("Мин. прогноз:", ensemble_preds_rub.min())
-print("Макс. прогноз:", ensemble_preds_rub.max())
-print("Среднее прогнозов:", ensemble_preds_rub.mean())
-print("Стд прогнозов:", ensemble_preds_rub.std())
+# ------------------------------------------------------------
+# Сохранение предсказаний для ВСЕХ устройств (полный датасет)
+# ------------------------------------------------------------
+print("\nГенерация предсказаний для всех устройств...")
+
+full_df = df.copy()
+
+full_df["name_l"] = full_df["name"].astype(str).str.lower()
+if "description" in full_df.columns:
+    full_df["desc_l"] = full_df["description"].astype(str).str.lower()
+else:
+    full_df["desc_l"] = ""
+full_df["text_l"] = full_df["name_l"] + " " + full_df["desc_l"]
+
+# Используем те же единые функции family
+full_df["cpu_family"] = full_df["text_l"].apply(cpu_family)
+full_df["gpu_family"] = full_df["text_l"].apply(gpu_family)
+
+if "device_type_label" not in full_df.columns:
+    full_df["device_type_label"] = full_df.apply(infer_device_type, axis=1)
+
+for col in enc_cols:
+    te_map = te_artifacts[col]["map"]
+    global_mean = te_artifacts[col]["global_mean"]
+    full_df[f"te_{col}"] = full_df[col].map(te_map).fillna(global_mean).astype(np.float32)
+
+missing_cols = set(feature_cols) - set(full_df.columns)
+if missing_cols:
+    print(f"Предупреждение: отсутствуют колонки {missing_cols}, будут заполнены нулями")
+    for c in missing_cols:
+        full_df[c] = 0.0
+
+X_full = full_df[feature_cols].values.astype(np.float32)
+X_full_scaled = scaler.transform(X_full)
+X_full_t = torch.tensor(X_full_scaled, dtype=torch.float32).to(device)
+
+all_preds = []
+for res in results:
+    model = MLP_GELU_NoRes(X_full.shape[1]).to(device)
+    model.load_state_dict(res["best_state"])
+    model.eval()
+    with torch.no_grad():
+        pred_log = model(X_full_t).cpu().numpy()
+    pred_rub = np.expm1(pred_log)
+    pred_rub = np.clip(pred_rub, a_min=0.0, a_max=None)   # исправлено: обрезаем отрицательные
+    all_preds.append(pred_rub)
+
+ensemble_full_preds = np.median(np.vstack(all_preds), axis=0)
+
+result_df = pd.DataFrame({
+    "name": full_df["name"],
+    "device_type": full_df["device_type_label"],
+    "real_price": full_df["price"].values,
+    "predicted_price": ensemble_full_preds,
+    "absolute_error": np.abs(full_df["price"].values - ensemble_full_preds),
+    "relative_error_percent": np.abs((full_df["price"].values - ensemble_full_preds) / (full_df["price"].values + 1e-8)) * 100
+})
+
+result_df.to_csv("all_predictions.csv", index=False)
+print(f"\nСохранён файл all_predictions.csv со {len(result_df)} записями")
+print(f"   Примеры:\n{result_df.head(10)}")
+
+print(f"Средняя абсолютная ошибка на всём датасете: {result_df['absolute_error'].mean():.2f} ₽")
+print("Мин. прогноз:", ensemble_full_preds.min())
+print("Макс. прогноз:", ensemble_full_preds.max())
+print("Среднее прогнозов:", ensemble_full_preds.mean())
+print("Стд прогнозов:", ensemble_full_preds.std())
