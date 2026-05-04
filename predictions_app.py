@@ -1,8 +1,3 @@
-"""
-sort_devices_pretty.py (исправлено – device_type восстанавливается из one-hot)
-Интерактивная сортировка устройств с читаемым выводом.
-"""
-
 import pandas as pd
 import numpy as np
 import re
@@ -22,13 +17,13 @@ def load_combined():
             original["device_type"] = "unknown"
 
     if len(original) != len(predictions):
-        print("⚠️ Число строк разное, объединяем по порядку (лучше пересоздать predictions).")
+        print("Число строк разное, объединяем по порядку (лучше пересоздать predictions).")
     combined = pd.concat(
         [original, predictions.drop(columns=["name", "device_type"], errors="ignore")],
         axis=1
     )
 
-    # ✅ Новая экономия: предсказанная цена минус реальная (если > 0)
+  
     combined["saved_amount"] = (combined["predicted_price"] - combined["price"]).clip(lower=0)
 
     return combined
